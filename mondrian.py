@@ -1,27 +1,35 @@
+"""
+Mondrian Multidimensional K-Anonymity
+=====================================
+Based on: K. LeFevre, D. J. DeWitt, R. Ramakrishnan,
+"Mondrian Multidimensional K-Anonymity," ICDE 2006.
+
+Implements greedy recursive partitioning on numeric quasi-identifiers.
+Generalization replaces QI values with the equivalence class mean.
+"""
+
 import pandas as pd
 import numpy as np
-from utils import NUMERICAL_QI, CATEGORICAL_QI
+from utils import NUMERICAL_QI
 
 
-def _normalize_range(series):
-    """Compute normalized range for a column (0-1 scale)."""
-    if not pd.api.types.is_numeric_dtype(series):
-        return len(series.unique()) / max(len(series), 1)
-    else:
-        col_min, col_max = series.min(), series.max()
-        if col_max == col_min:
-            return 0.0
-        return (col_max - col_min) / col_max
+def _get_span(partition, dim):
+    """Compute the normalized span (range / global max) for a dimension."""
+    col = partition[dim]
+    col_min, col_max = col.min(), col.max()
+    if col_max == col_min:
+        return 0.0
+    return (col_max - col_min) / max(abs(col_max), 1)
 
 
-def _choose_dimension(df, qi_columns):
-    """Choose the QI dimension with the largest normalized range."""
+def _choose_dimension(partition, qi_columns):
+    """Choose the QI dimension with the largest normalized span."""
     best_dim = None
-    best_range = -1.0
+    best_span = -1.0
     for col in qi_columns:
-        r = _normalize_range(df[col])
-        if r > best_range:
-            best_range = r
+        span = _get_span(partition, col)
+        if span > best_span:
+            best_span = span
             best_dim = col
     return best_dim
 
@@ -34,75 +42,71 @@ def _split_numerical(df, col):
     return lhs, rhs
 
 
-def _split_categorical(df, col):
-    """Split a categorical column into two roughly equal halves by frequency."""
-    freq = df[col].value_counts()
-    values = freq.index.tolist()
-
-    # Sort by frequency and split into two groups
-    half = len(df) // 2
-    cumsum = 0
-    split_idx = 0
-    for i, v in enumerate(values):
-        cumsum += freq[v]
-        if cumsum >= half:
-            split_idx = i + 1
-            break
-
-    if split_idx == 0:
-        split_idx = 1
-    if split_idx >= len(values):
-        split_idx = len(values) - 1
-
-    left_vals = set(values[:split_idx])
-    lhs = df[df[col].isin(left_vals)]
-    rhs = df[~df[col].isin(left_vals)]
-    return lhs, rhs
-
-
 def _mondrian_partition(df, qi_columns, k):
     """Recursively partition the data using Mondrian algorithm."""
     if len(df) < 2 * k:
         return [df]
 
-    dim = _choose_dimension(df, qi_columns)
-    if dim is None:
-        return [df]
+    # Try dimensions in order of span, largest first
+    tried = set()
+    while len(tried) < len(qi_columns):
+        remaining = [d for d in qi_columns if d not in tried]
+        dim = _choose_dimension(df, remaining)
+        if dim is None:
+            break
+        tried.add(dim)
 
-    if dim in NUMERICAL_QI:
         lhs, rhs = _split_numerical(df, dim)
-    else:
-        lhs, rhs = _split_categorical(df, dim)
 
-    # If split fails to produce valid partitions, return current partition
-    if len(lhs) < k or len(rhs) < k:
-        return [df]
+        # Check if split produces valid partitions
+        if len(lhs) >= k and len(rhs) >= k:
+            return _mondrian_partition(lhs, qi_columns, k) + _mondrian_partition(rhs, qi_columns, k)
 
-    return _mondrian_partition(lhs, qi_columns, k) + _mondrian_partition(rhs, qi_columns, k)
+    # No valid split found — this is a leaf partition
+    return [df]
 
 
 def _generalize_partition(partition, qi_columns):
-    """Generalize QI values within a partition."""
+    """Generalize QI values within a partition by replacing with the mean."""
     result = partition.copy()
     for col in qi_columns:
-        if col in NUMERICAL_QI:
-            col_min = partition[col].min()
-            col_max = partition[col].max()
-            if col_min == col_max:
-                result[col] = str(col_min)
-            else:
-                result[col] = f"{col_min}-{col_max}"
-        else:
-            unique_vals = sorted(partition[col].unique())
-            if len(unique_vals) == 1:
-                result[col] = unique_vals[0]
-            else:
-                result[col] = ",".join(unique_vals)
+        mean_val = partition[col].mean()
+        result[col] = mean_val
     return result
 
 
+def compute_information_loss(partitions, total_records, k):
+    """
+    Compute information loss metrics from the Mondrian paper.
+
+    Returns:
+        dict with:
+        - C_DM: Discernability metric (sum of |E|^2 for each equivalence class E)
+        - C_AVG: Normalized average equivalence class size
+        - num_classes: Number of equivalence classes
+        - min_size: Smallest equivalence class
+        - max_size: Largest equivalence class
+        - avg_size: Average equivalence class size
+    """
+    sizes = [len(p) for p in partitions]
+    c_dm = sum(s ** 2 for s in sizes)
+    num_classes = len(sizes)
+    avg_size = total_records / num_classes if num_classes > 0 else 0
+    c_avg = avg_size / k if k > 0 else 0
+
+    return {
+        "C_DM": c_dm,
+        "C_AVG": c_avg,
+        "num_classes": num_classes,
+        "min_size": min(sizes),
+        "max_size": max(sizes),
+        "avg_size": avg_size,
+    }
+
+
 def mondrian_k_anonymity(df, k, qi_columns):
-    """Apply Mondrian multidimensional K-anonymity.
+    """
+    Apply Mondrian multidimensional K-anonymity.
 
     Args:
         df: Input DataFrame.
@@ -110,13 +114,30 @@ def mondrian_k_anonymity(df, k, qi_columns):
         qi_columns: List of quasi-identifier column names.
 
     Returns:
-        Anonymized DataFrame with generalized QI values.
+        tuple: (anonymized_df, partitions, info_loss_metrics)
     """
-    partitions = _mondrian_partition(df, qi_columns, k)
+    # Preserve original index for correct assignment
+    df_work = df.copy()
+    df_work["_orig_idx"] = df_work.index
 
-    anonymized_parts = []
+    partitions = _mondrian_partition(df_work, qi_columns, k)
+
+    # Validate: every partition has >= k records
+    for i, part in enumerate(partitions):
+        assert len(part) >= k, f"Partition {i} has {len(part)} records, expected >= {k}"
+
+    # Compute information loss before generalization
+    info_loss = compute_information_loss(partitions, len(df), k)
+
+    # Generalize: replace QI values with partition mean
+    anon_df = df.copy()
+    for qi in qi_columns:
+        anon_df[qi] = anon_df[qi].astype(float)
+
     for part in partitions:
-        anonymized_parts.append(_generalize_partition(part, qi_columns))
+        indices = part["_orig_idx"].values
+        for qi in qi_columns:
+            mean_val = part[qi].mean()
+            anon_df.loc[indices, qi] = mean_val
 
-    result = pd.concat(anonymized_parts, ignore_index=True)
-    return result
+    return anon_df, partitions, info_loss

@@ -29,34 +29,29 @@ DATA_COLUMNS = [
     "income",
 ]
 
+# Use numeric-only quasi-identifiers for clean Mondrian partitioning
 QUASI_IDENTIFIERS = [
     "age",
-    "workclass",
-    "education",
-    "marital-status",
-    "occupation",
-    "race",
-    "sex",
-    "native-country",
-]
-
-NUMERICAL_QI = ["age"]
-CATEGORICAL_QI = [
-    "workclass",
-    "education",
-    "marital-status",
-    "occupation",
-    "race",
-    "sex",
-    "native-country",
-]
-
-FEATURE_COLUMNS = QUASI_IDENTIFIERS + [
     "education-num",
+    "hours-per-week",
     "capital-gain",
     "capital-loss",
-    "hours-per-week",
+]
+
+# All QIs are numeric in this configuration
+NUMERICAL_QI = QUASI_IDENTIFIERS[:]
+CATEGORICAL_QI = []
+
+# Features used for ML (includes non-QI columns for richer signal)
+FEATURE_COLUMNS = QUASI_IDENTIFIERS + [
+    "workclass",
+    "education",
+    "marital-status",
+    "occupation",
     "relationship",
+    "race",
+    "sex",
+    "native-country",
 ]
 
 
@@ -74,28 +69,13 @@ def load_adult_dataset(data_dir="data"):
     # Remove rows with missing values
     df = df.replace("?", np.nan).dropna().reset_index(drop=True)
 
-    # Drop fnlwgt (direct identifier, not useful)
+    # Drop fnlwgt (sampling weight, not useful for classification)
     df = df.drop(columns=["fnlwgt"])
 
     # Binary encode income
-    df["income"] = (df["income"].str.strip() == ">50K").astype(int)
+    df["income"] = (df["income"].str.strip().str.rstrip(".") == ">50K").astype(int)
 
     return df
-
-
-def _parse_numerical_range(val):
-    """Convert a generalized numerical value (e.g. '25-35' or '30') to midpoint."""
-    s = str(val)
-    if "-" in s:
-        parts = s.split("-")
-        try:
-            return (float(parts[0]) + float(parts[-1])) / 2.0
-        except ValueError:
-            return float("nan")
-    try:
-        return float(s)
-    except ValueError:
-        return float("nan")
 
 
 def prepare_ml_data(df, test_size=0.2, random_state=42, is_anonymized=False):
@@ -104,18 +84,16 @@ def prepare_ml_data(df, test_size=0.2, random_state=42, is_anonymized=False):
     labels = df["income"].values
 
     if is_anonymized:
-        # Handle generalized numerical QI columns: convert ranges to midpoints
+        # Anonymized QI columns are already floats (partition means)
         for col in NUMERICAL_QI:
             if col in features.columns:
-                features[col] = features[col].apply(_parse_numerical_range)
+                features[col] = features[col].astype(float)
 
-    # Label-encode categorical columns (keeps feature count manageable)
+    # Label-encode categorical columns
     cat_cols = [c for c in features.columns if not pd.api.types.is_numeric_dtype(features[c])]
-    label_encoders = {}
     for col in cat_cols:
         le = LabelEncoder()
         features[col] = le.fit_transform(features[col].astype(str))
-        label_encoders[col] = le
 
     features = features.astype(float)
 
